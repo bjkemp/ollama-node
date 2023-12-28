@@ -1,14 +1,18 @@
-import { RequestOptions, get as srcget, request, IncomingMessage } from 'http';
-export type FinalOutput = {
-  messages: {}[],
-  final: {}
-}
+import { GenerateFinalOutput } from "./ollama"
+
 export type GenerateMessage = {
   model: string,
   created_at: string,
   response: string,
   done: boolean
 }
+
+export type FinalOutput = {
+  messages: GenerateMessage[],
+  final: GenerateFinalOutput
+}
+
+
 export type GenerateComplete = {
   model: string,
   created_at: string,
@@ -21,6 +25,14 @@ export type GenerateComplete = {
   eval_count: number,
   eval_duration: number
 }
+
+export interface RequestOptions {
+  hostname: string,
+  port: number,
+  method: string,
+  path: string
+}
+
 interface Options {
   seed?: number;
   numa?: boolean;
@@ -77,52 +89,57 @@ type PostInput<T> =
   T extends 'embed' ? { model: string, prompt: string } :
   never;
 
+function generateUrl(options: RequestOptions): string {
+  return `http://${options.hostname}:${options.port}${options.path}`;
+}
 
-export function requestList(options: RequestOptions) {
-  return new Promise((resolve, reject) => {
-    const req = request(options, (response) => {
-      const statusCode = response.statusCode || 0;
-      if (statusCode < 200 || statusCode > 299) {
-        return reject(new Error(`Failed with status code: ${response.statusCode}`));
+export async function requestList(options: RequestOptions) {
+  const url = generateUrl(options)
+
+  const response = await fetch(url, options);
+
+  if (!response.ok) {
+    throw new Error(`Failed with status code: ${response.status}`);
+  }
+
+  const reader = response.body?.getReader();
+  let chunks: Uint8Array[] = [];
+  if (reader) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
       }
-      const body: string[] = [];
+      if (value) {
+        chunks.push(value);
+      }
+    }
+  }
+  
+  const decoder = new TextDecoder();
+  const joined = chunks.map(chunk => decoder.decode(chunk)).join('');
+  const parsed = JSON.parse(joined);
+  return parsed;
+}
 
-      response.on('data', (chunk: string) => body.push(chunk));
-      response.on('end', () => {
-        const joined = body.join('');
-        const parsed = JSON.parse(joined);
-        resolve(parsed)
-      });
-    });
+export async function requestShowInfo(options: RequestOptions, model: string) {
+  const url = generateUrl(options)
 
-    req.on('error', reject);
-    req.end();
+  const response = await fetch(url, {
+    method: options.method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    },
+    body: JSON.stringify({ "name": model })
   });
-};
 
-export function requestShowInfo(options: RequestOptions, model: string) {
-  return new Promise((resolve, reject) => {
-    const req = request(options, (response) => {
-      const statusCode = response.statusCode || 0;
-      if (statusCode < 200 || statusCode > 299) {
-        return reject(new Error(`Failed with status code: ${response.statusCode}`));
-      }
-      const body: string[] = [];
+  if (!response.ok) {
+    throw new Error(`Failed with status code: ${response.status}`);
+  }
 
-
-      response.on('data', (chunk: string) => body.push(chunk));
-      response.on('end', () => {
-
-        const joined = body.join('');
-        const parsed = JSON.parse(joined);
-        resolve(parsed)
-      });
-    });
-    req.write(JSON.stringify({ "name": model }));
-    req.on('error', reject);
-    req.end();
-  })
-
+  const data = await response.json();
+  return data;
 }
 
 export function requestDelete(options: RequestOptions, model: string) {
@@ -150,36 +167,101 @@ export function requestDelete(options: RequestOptions, model: string) {
 
 }
 
-export function requestPost<P extends PostTarget>(target: P, options: RequestOptions, databody: PostInput<P>): Promise<FinalOutput> {
-  let body: {}[] = [];
-  return new Promise((resolve, reject) => {
-    const req = request(options, (response) => {
-      const statusCode = response.statusCode || 0;
-      if (statusCode < 200 || statusCode > 299) {
-        return reject(new Error(`Failed with status code: ${response.statusCode}`));
-      }
-      response.on('data', (chunk) => {
-        if (target === 'embed') {
-          // console.log('hi');
-          body.push(chunk.toString('utf8'))
-        } else {
-          body.push(JSON.parse(chunk));
+export async function requestPost<P extends PostTarget>(target: P, options: RequestOptions, databody: PostInput<P>): Promise<FinalOutput> {
+  const url = generateUrl(options)
+  let ollamaStream: string = ''
+  let output: string = ''
+
+  let finalOutput: FinalOutput;
+
+  await fetch(url, {
+    method: options.method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    },
+    body: JSON.stringify(databody)
+  })
+  .then((response) => {
+    const reader = response.body.getReader();
+    let chunks = [];
+    return new ReadableStream({
+      start(controller) {
+        return pump();
+        function pump() {
+          return reader.read().then(({ done, value }) => {
+            // When no more data needs to be consumed, close the stream
+            if (done) {
+              controller.close();
+              return;
+            }
+            // Enqueue the next data chunk into our target stream
+            chunks.push(value);
+            controller.enqueue(value);
+            return pump();
+          });
         }
-      });
-      response.on('end', () => {
-        if (target === 'embed') {
-          resolve({ messages: [], final: JSON.parse(body.join('')) })
-        } else {
-          const final = body[body.length - 1];
-          const messages = body.splice(0, body.length - 1);
-          resolve({ messages, final });
-        }
-      });
+      },
     });
-    req.write(JSON.stringify(databody));
-    req.on('error', reject);
-    req.end();
-  });
+  })
+  // Create a new response out of the stream
+  .then((stream) => new Response(stream))
+  // Read the response as text
+  .then((response) => response.text())
+  .then((text) => ollamaStream += text )
+  .finally(() => {
+    // Replace newlines in the string with commas
+    let json_text = ollamaStream.replace(/(?:\r\n|\r|\n)/g, ',' + '\n')
+    // Trim the trailing comma
+    json_text = json_text.slice(0, -2)
+    const json = JSON.parse(`[${json_text}]`)
+
+    json.forEach((item: any) => {
+      if (item.hasOwnProperty('error')) {
+        console.log(`Error: ${item.error}`)
+      } else {
+        output += item.response
+      }
+    })
+
+    finalOutput = { messages: json, final: output }
+  })
+  .catch((err) => console.error(err))
+
+  return finalOutput
+
+
+  // const response = await fetch(url, {
+  //   method: options.method,
+  //   headers: {
+  //     'Content-Type': 'application/json',
+  //     ...options.headers
+  //   },
+  //   body: JSON.stringify(databody)
+  // });
+
+  // if (!response.ok) {
+  //   throw new Error(`Failed with status code: ${response.status}`);
+  // }
+
+  // const res = await response
+  // // const data = await res.body
+  // console.log(res)
+
+  // const data = await response.json();
+  // let finalOutput: FinalOutput;
+
+  // if (typeof data === 'object' && data !== null) {
+  //   if (target === 'embed') {
+  //     finalOutput = { messages: [], final: JSON.parse(data.response) };
+  //   } else {
+  //     const final = data.response;
+  //     const messages = []; // You might need to adjust this based on how you want to handle messages
+  //     finalOutput = { messages, final };
+  //   }
+  // } else {
+  //   throw new Error('Expected data to be an object, but it was not.');
+  // }
 }
 
 export function streamingPost<P extends PostTarget>(target: P, options: RequestOptions, databody: PostInput<P>, callback: (chunk: any) => void) {
