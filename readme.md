@@ -1,5 +1,7 @@
 # Simple JS library to work with Ollama
 
+FORKED FROM https://github.com/technovangelist/ollama-node.git
+
 The simplest JavaScript library for the easiest way to run LLMs.
 
 This is not the official library (we don't have one), but I am one of the maintainers of Ollama.
